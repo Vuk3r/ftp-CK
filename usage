@@ -1,0 +1,11 @@
+#Usage
+#To build the project:
+make
+#To clean build artifacts:
+make clean
+#To rebuild from scratch:
+make rebuild
+#The Makefile is ready. You can run:
+./ftpd_ui to start the FTP server
+./ftp_client_ui to start the FTP client
+#Both programs have GTK UIs where you can set IP addresses and ports for LAN connections.

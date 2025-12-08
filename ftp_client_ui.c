@@ -1,0 +1,419 @@
+#include <gtk/gtk.h>
+#include "ftp_client.h"
+
+static GtkWidget *server_ip_entry;
+static GtkWidget *server_port_entry;
+static GtkWidget *username_entry;
+static GtkWidget *password_entry;
+static GtkWidget *connect_button;
+static GtkWidget *disconnect_button;
+static GtkWidget *file_list_box;
+static GtkWidget *remote_file_entry;
+static GtkWidget *local_file_entry;
+static GtkWidget *upload_button;
+static GtkWidget *download_button;
+static GtkWidget *refresh_button;
+static GtkWidget *local_file_browse_button;
+static GtkWidget *save_path_button;
+static GtkWidget *select_remote_button;
+static GtkWidget *status_label;
+
+static ftp_client_t client;
+static gboolean connected = FALSE;
+
+// Forward declarations
+static void on_refresh_clicked(GtkWidget *widget, gpointer data);
+
+static void clear_file_list(void) {
+    if (!file_list_box) return;
+    GList *children = gtk_container_get_children(GTK_CONTAINER(file_list_box));
+    for (GList *iter = children; iter != NULL; iter = iter->next) {
+        gtk_widget_destroy(GTK_WIDGET(iter->data));
+    }
+    g_list_free(children);
+}
+
+static char *extract_filename(const char *line) {
+    if (!line) return NULL;
+    const char *last_space = strrchr(line, ' ');
+    const char *candidate = last_space ? last_space + 1 : line;
+    if (*candidate == '\0') return NULL;
+    return g_strdup(candidate);
+}
+
+static void add_remote_row(const char *line) {
+    if (!line || !file_list_box) return;
+    GtkWidget *row = gtk_list_box_row_new();
+    GtkWidget *label = gtk_label_new(line);
+    gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+    gtk_container_add(GTK_CONTAINER(row), label);
+    char *name = extract_filename(line);
+    if (name) {
+        g_object_set_data_full(G_OBJECT(row), "remote_name", name, g_free);
+    }
+    gtk_container_add(GTK_CONTAINER(file_list_box), row);
+    gtk_widget_show_all(row);
+}
+
+static void set_connection_state(gboolean is_connected) {
+    connected = is_connected;
+    gtk_widget_set_sensitive(connect_button, !is_connected);
+    gtk_widget_set_sensitive(disconnect_button, is_connected);
+    gtk_widget_set_sensitive(server_ip_entry, !is_connected);
+    gtk_widget_set_sensitive(server_port_entry, !is_connected);
+    gtk_widget_set_sensitive(username_entry, !is_connected);
+    gtk_widget_set_sensitive(password_entry, !is_connected);
+    gtk_widget_set_sensitive(refresh_button, is_connected);
+    gtk_widget_set_sensitive(upload_button, is_connected);
+    gtk_widget_set_sensitive(download_button, is_connected);
+    gtk_widget_set_sensitive(local_file_browse_button, is_connected);
+    gtk_widget_set_sensitive(select_remote_button, is_connected);
+    gtk_widget_set_sensitive(save_path_button, is_connected);
+    if (!is_connected) {
+        clear_file_list();
+    }
+}
+
+static void update_status(const char *message) {
+    gtk_label_set_text(GTK_LABEL(status_label), message);
+}
+
+static void on_connect_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget; (void)data; // Suppress unused parameter warnings
+    if (connected) return;
+    
+    const char *ip = gtk_entry_get_text(GTK_ENTRY(server_ip_entry));
+    const char *port_str = gtk_entry_get_text(GTK_ENTRY(server_port_entry));
+    const char *username = gtk_entry_get_text(GTK_ENTRY(username_entry));
+    const char *password = gtk_entry_get_text(GTK_ENTRY(password_entry));
+    
+    int port = atoi(port_str);
+    if (port <= 0 || port > 65535) {
+        update_status("Invalid port number");
+        return;
+    }
+    
+    if (strlen(ip) == 0) {
+        update_status("Please enter server IP");
+        return;
+    }
+
+    if (ftp_connect(&client, ip, port) < 0) {
+        update_status("Connection failed");
+        return;
+    }
+    
+    if (ftp_login(&client, username, password) < 0) {
+        update_status("Login failed");
+        ftp_disconnect(&client);
+        return;
+    }
+    
+    set_connection_state(TRUE);
+
+    char path[FTP_BUFFER_SIZE];
+    if (ftp_pwd(&client, path, sizeof(path)) == 0) {
+        char status_msg[FTP_BUFFER_SIZE];
+        snprintf(status_msg, sizeof(status_msg), "Connected to %s:%d • %s", ip, port, path);
+        update_status(status_msg);
+    } else {
+        update_status("Connected");
+    }
+
+    on_refresh_clicked(NULL, NULL);
+}
+
+static void on_disconnect_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget; (void)data; // Suppress unused parameter warnings
+    if (!connected) return;
+    
+    ftp_disconnect(&client);
+    set_connection_state(FALSE);
+    update_status("Disconnected");
+}
+
+static void on_refresh_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget; (void)data; // Suppress unused parameter warnings
+    if (!connected) return;
+    
+    char buffer[FTP_BUFFER_SIZE];
+    if (ftp_list(&client, buffer, sizeof(buffer)) == 0) {
+        clear_file_list();
+        char *cursor = buffer;
+        while (cursor && *cursor) {
+            char *line_end = strchr(cursor, '\n');
+            if (line_end) {
+                *line_end = '\0';
+            }
+            g_strstrip(cursor);
+            if (strlen(cursor) > 0) {
+                add_remote_row(cursor);
+            }
+            if (!line_end) break;
+            cursor = line_end + 1;
+        }
+        update_status("File list refreshed");
+    } else {
+        update_status("Failed to refresh file list");
+    }
+}
+
+static void on_upload_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget; (void)data; // Suppress unused parameter warnings
+    if (!connected) return;
+    
+    const char *local_file = gtk_entry_get_text(GTK_ENTRY(local_file_entry));
+    const char *remote_file = gtk_entry_get_text(GTK_ENTRY(remote_file_entry));
+    
+    if (strlen(local_file) == 0 || strlen(remote_file) == 0) {
+        update_status("Please specify both local and remote file names");
+        return;
+    }
+    
+    if (ftp_stor(&client, local_file, remote_file) == 0) {
+        update_status("File uploaded successfully");
+        on_refresh_clicked(NULL, NULL);
+    } else {
+        update_status("Upload failed");
+    }
+}
+
+static void on_download_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget; (void)data; // Suppress unused parameter warnings
+    if (!connected) return;
+    
+    const char *remote_file = gtk_entry_get_text(GTK_ENTRY(remote_file_entry));
+    const char *local_file = gtk_entry_get_text(GTK_ENTRY(local_file_entry));
+    
+    if (strlen(remote_file) == 0 || strlen(local_file) == 0) {
+        update_status("Please specify both remote and local file names");
+        return;
+    }
+    
+    if (ftp_retr(&client, remote_file, local_file) == 0) {
+        update_status("File downloaded successfully");
+    } else {
+        update_status("Download failed");
+    }
+}
+
+static void on_select_local_file_clicked(GtkWidget *widget, gpointer data) {
+    (void)data;
+    GtkWidget *dialog = gtk_file_chooser_dialog_new(
+        "Select Local File",
+        GTK_WINDOW(gtk_widget_get_toplevel(widget)),
+        GTK_FILE_CHOOSER_ACTION_OPEN,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Open", GTK_RESPONSE_ACCEPT,
+        NULL);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        char *filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+        if (filename) {
+            gtk_entry_set_text(GTK_ENTRY(local_file_entry), filename);
+            g_free(filename);
+        }
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void on_select_save_path_clicked(GtkWidget *widget, gpointer data) {
+    (void)data;
+    GtkWidget *dialog = gtk_file_chooser_dialog_new(
+        "Select Download Path",
+        GTK_WINDOW(gtk_widget_get_toplevel(widget)),
+        GTK_FILE_CHOOSER_ACTION_SAVE,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Save", GTK_RESPONSE_ACCEPT,
+        NULL);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        char *filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+        if (filename) {
+            gtk_entry_set_text(GTK_ENTRY(local_file_entry), filename);
+            g_free(filename);
+        }
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void on_use_remote_selection_clicked(GtkWidget *widget, gpointer data) {
+    (void)widget; (void)data;
+    GtkListBoxRow *row = gtk_list_box_get_selected_row(GTK_LIST_BOX(file_list_box));
+    if (!row) return;
+    const char *name = g_object_get_data(G_OBJECT(row), "remote_name");
+    if (name && strlen(name) > 0) {
+        gtk_entry_set_text(GTK_ENTRY(remote_file_entry), name);
+    }
+}
+
+static void on_remote_row_activated(GtkListBox *box, GtkListBoxRow *row, gpointer data) {
+    (void)box; (void)data;
+    const char *name = g_object_get_data(G_OBJECT(row), "remote_name");
+    if (name && strlen(name) > 0) {
+        gtk_entry_set_text(GTK_ENTRY(remote_file_entry), name);
+    }
+}
+
+static void on_destroy(GtkWidget *widget, gpointer data) {
+    (void)widget; (void)data; // Suppress unused parameter warnings
+    if (connected) {
+        ftp_disconnect(&client);
+    }
+    gtk_main_quit();
+}
+
+int main(int argc, char *argv[]) {
+    gtk_init(&argc, &argv);
+    
+    memset(&client, 0, sizeof(client));
+    
+    GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(window), "FTP Client");
+    gtk_window_set_default_size(GTK_WINDOW(window), 700, 600);
+    g_signal_connect(window, "destroy", G_CALLBACK(on_destroy), NULL);
+    
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_container_add(GTK_CONTAINER(window), vbox);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    
+    // Connection settings
+    GtkWidget *conn_frame = gtk_frame_new("Connection Settings");
+    GtkWidget *conn_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_container_add(GTK_CONTAINER(conn_frame), conn_vbox);
+    gtk_container_set_border_width(GTK_CONTAINER(conn_vbox), 5);
+    
+    GtkWidget *ip_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    GtkWidget *ip_label = gtk_label_new("Server IP:");
+    gtk_widget_set_size_request(ip_label, 100, -1);
+    server_ip_entry = gtk_entry_new();
+    gtk_entry_set_text(GTK_ENTRY(server_ip_entry), "127.0.0.1");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(server_ip_entry), "Server IP");
+    gtk_box_pack_start(GTK_BOX(ip_box), ip_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(ip_box), server_ip_entry, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(conn_vbox), ip_box, FALSE, FALSE, 0);
+    
+    GtkWidget *port_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    GtkWidget *port_label = gtk_label_new("Port:");
+    gtk_widget_set_size_request(port_label, 100, -1);
+    server_port_entry = gtk_entry_new();
+    gtk_entry_set_text(GTK_ENTRY(server_port_entry), "21");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(server_port_entry), "Port");
+    gtk_box_pack_start(GTK_BOX(port_box), port_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(port_box), server_port_entry, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(conn_vbox), port_box, FALSE, FALSE, 0);
+    
+    GtkWidget *user_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    GtkWidget *user_label = gtk_label_new("Username:");
+    gtk_widget_set_size_request(user_label, 100, -1);
+    username_entry = gtk_entry_new();
+    gtk_entry_set_text(GTK_ENTRY(username_entry), "user");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(username_entry), "Username");
+    gtk_box_pack_start(GTK_BOX(user_box), user_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(user_box), username_entry, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(conn_vbox), user_box, FALSE, FALSE, 0);
+    
+    GtkWidget *pass_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    GtkWidget *pass_label = gtk_label_new("Password:");
+    gtk_widget_set_size_request(pass_label, 100, -1);
+    password_entry = gtk_entry_new();
+    gtk_entry_set_visibility(GTK_ENTRY(password_entry), FALSE);
+    gtk_entry_set_text(GTK_ENTRY(password_entry), "pass");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(password_entry), "Password");
+    gtk_box_pack_start(GTK_BOX(pass_box), pass_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(pass_box), password_entry, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(conn_vbox), pass_box, FALSE, FALSE, 0);
+    
+    GtkWidget *conn_button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    connect_button = gtk_button_new_with_label("Connect");
+    disconnect_button = gtk_button_new_with_label("Disconnect");
+    gtk_widget_set_sensitive(disconnect_button, FALSE);
+    g_signal_connect(connect_button, "clicked", G_CALLBACK(on_connect_clicked), NULL);
+    g_signal_connect(disconnect_button, "clicked", G_CALLBACK(on_disconnect_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(conn_button_box), connect_button, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(conn_button_box), disconnect_button, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(conn_vbox), conn_button_box, FALSE, FALSE, 0);
+    
+    gtk_box_pack_start(GTK_BOX(vbox), conn_frame, FALSE, FALSE, 0);
+    
+    // File list
+    GtkWidget *list_frame = gtk_frame_new("Remote Files");
+    GtkWidget *list_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_container_add(GTK_CONTAINER(list_frame), list_vbox);
+    gtk_container_set_border_width(GTK_CONTAINER(list_vbox), 5);
+    
+    GtkWidget *list_button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    refresh_button = gtk_button_new_with_label("Refresh");
+    gtk_widget_set_sensitive(refresh_button, FALSE);
+    g_signal_connect(refresh_button, "clicked", G_CALLBACK(on_refresh_clicked), NULL);
+    select_remote_button = gtk_button_new_with_label("Use Selection");
+    gtk_widget_set_sensitive(select_remote_button, FALSE);
+    g_signal_connect(select_remote_button, "clicked", G_CALLBACK(on_use_remote_selection_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(list_button_box), refresh_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(list_button_box), select_remote_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(list_vbox), list_button_box, FALSE, FALSE, 0);
+    
+    GtkWidget *scrolled = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    file_list_box = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(file_list_box), GTK_SELECTION_SINGLE);
+    g_signal_connect(file_list_box, "row-activated", G_CALLBACK(on_remote_row_activated), NULL);
+    gtk_container_add(GTK_CONTAINER(scrolled), file_list_box);
+    gtk_box_pack_start(GTK_BOX(list_vbox), scrolled, TRUE, TRUE, 0);
+    
+    gtk_box_pack_start(GTK_BOX(vbox), list_frame, TRUE, TRUE, 0);
+    
+    // File transfer
+    GtkWidget *transfer_frame = gtk_frame_new("File Transfer");
+    GtkWidget *transfer_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_container_add(GTK_CONTAINER(transfer_frame), transfer_vbox);
+    gtk_container_set_border_width(GTK_CONTAINER(transfer_vbox), 5);
+    
+    GtkWidget *remote_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    GtkWidget *remote_label = gtk_label_new("Remote File:");
+    gtk_widget_set_size_request(remote_label, 100, -1);
+    remote_file_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(remote_file_entry), "remote.txt");
+    gtk_box_pack_start(GTK_BOX(remote_box), remote_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(remote_box), remote_file_entry, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(transfer_vbox), remote_box, FALSE, FALSE, 0);
+    
+    GtkWidget *local_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    GtkWidget *local_label = gtk_label_new("Local File:");
+    gtk_widget_set_size_request(local_label, 100, -1);
+    local_file_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(local_file_entry), "local path");
+    gtk_box_pack_start(GTK_BOX(local_box), local_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(local_box), local_file_entry, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(transfer_vbox), local_box, FALSE, FALSE, 0);
+    
+    GtkWidget *transfer_button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    upload_button = gtk_button_new_with_label("Upload");
+    download_button = gtk_button_new_with_label("Download");
+    local_file_browse_button = gtk_button_new_with_label("Browse");
+    gtk_widget_set_sensitive(upload_button, FALSE);
+    gtk_widget_set_sensitive(download_button, FALSE);
+    gtk_widget_set_sensitive(local_file_browse_button, FALSE);
+    gtk_widget_set_sensitive(save_path_button, FALSE);
+    g_signal_connect(upload_button, "clicked", G_CALLBACK(on_upload_clicked), NULL);
+    g_signal_connect(download_button, "clicked", G_CALLBACK(on_download_clicked), NULL);
+    g_signal_connect(local_file_browse_button, "clicked", G_CALLBACK(on_select_local_file_clicked), NULL);
+    g_signal_connect(save_path_button, "clicked", G_CALLBACK(on_select_save_path_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(transfer_button_box), upload_button, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(transfer_button_box), download_button, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(transfer_button_box), local_file_browse_button, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(transfer_button_box), save_path_button, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(transfer_vbox), transfer_button_box, FALSE, FALSE, 0);
+    
+    gtk_box_pack_start(GTK_BOX(vbox), transfer_frame, FALSE, FALSE, 0);
+    
+    // Status
+    status_label = gtk_label_new("Not connected");
+    gtk_box_pack_start(GTK_BOX(vbox), status_label, FALSE, FALSE, 0);
+    
+    gtk_widget_show_all(window);
+    gtk_main();
+    
+    return 0;
+}
