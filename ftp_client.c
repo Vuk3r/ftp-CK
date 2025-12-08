@@ -2,6 +2,8 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <unistd.h>
+#include <sys/select.h>
 
 static void client_log_error(const char *fmt, ...) {
     va_list args;
@@ -31,8 +33,14 @@ static ssize_t recv_line(int sockfd, char *buffer, size_t size) {
     while (count < size - 1) {
         char c;
         ssize_t n = recv(sockfd, &c, 1, 0);
-        if (n <= 0) {
-            return n;
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0) {
+            return 0;
         }
         buffer[count++] = c;
         if (c == '\n') {
@@ -51,7 +59,28 @@ static void trim_crlf(char *line) {
     }
 }
 
+static int check_connection_lost(ftp_client_t *client) {
+    if (!client || !client->connected || client->control_fd < 0) {
+        return 1;
+    }
+    int error = 0;
+    socklen_t len = sizeof(error);
+    if (getsockopt(client->control_fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
+        return 1;
+    }
+    if (error != 0) {
+        return 1;
+    }
+    return 0;
+}
+
 static int read_response(ftp_client_t *client, int *code, char *message, size_t message_size) {
+    if (client->connected && check_connection_lost(client)) {
+        client_log_error("Connection lost");
+        client->connected = 0;
+        return -1;
+    }
+    
     char line[FTP_MAX_LINE];
     int primary_code = 0;
     int expecting_multi = 0;
@@ -59,11 +88,17 @@ static int read_response(ftp_client_t *client, int *code, char *message, size_t 
     while (1) {
         ssize_t n = recv_line(client->control_fd, line, sizeof(line));
         if (n < 0) {
-            client_log_error("Failed to receive response from server: %s", strerror(errno));
+            if (errno == ECONNRESET || errno == EPIPE || errno == ETIMEDOUT) {
+                client_log_error("Connection lost: %s", strerror(errno));
+                client->connected = 0;
+            } else {
+                client_log_error("Failed to receive response from server: %s", strerror(errno));
+            }
             return -1;
         }
         if (n == 0) {
-            client_log_error("Connection closed by server while awaiting response");
+            client_log_error("Connection closed by server");
+            client->connected = 0;
             return -1;
         }
 
@@ -131,9 +166,24 @@ static int send_command(ftp_client_t *client, const char *fmt, ...) {
     buffer[len++] = '\n';
     buffer[len] = '\0';
 
+    if (check_connection_lost(client)) {
+        client_log_error("Connection lost before sending command");
+        client->connected = 0;
+        return -1;
+    }
+    
     ssize_t sent = send(client->control_fd, buffer, len, 0);
-    if (sent < 0 || (size_t)sent != strlen(buffer)) {
-        client_log_error("Failed to send command '%.*s': %s", 20, buffer, strerror(errno));
+    if (sent < 0) {
+        if (errno == ECONNRESET || errno == EPIPE || errno == ETIMEDOUT) {
+            client_log_error("Connection lost while sending command");
+            client->connected = 0;
+        } else {
+            client_log_error("Failed to send command '%.*s': %s", 20, buffer, strerror(errno));
+        }
+        return -1;
+    }
+    if ((size_t)sent != strlen(buffer)) {
+        client_log_error("Partial send for command '%.*s'", 20, buffer);
         return -1;
     }
     return 0;
@@ -179,8 +229,26 @@ int ftp_connect(ftp_client_t *client, const char *ip, int port) {
         return -1;
     }
 
+    struct timeval timeout;
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+    FD_SET(client->control_fd, &read_fds);
+    timeout.tv_sec = 2;
+    timeout.tv_usec = 0;
+    select(client->control_fd + 1, &read_fds, NULL, NULL, &timeout);
+    
     int code = 0;
-    if (read_response(client, &code, NULL, 0) < 0 || code != FTP_READY) {
+    if (read_response(client, &code, NULL, 0) < 0) {
+        if (code == 0) {
+            client_log_error("Server did not respond with READY (connection may be closed)");
+        } else {
+            client_log_error("Server did not respond with READY (expected %d, got %d)", FTP_READY, code);
+        }
+        close(client->control_fd);
+        client->control_fd = -1;
+        return -1;
+    }
+    if (code != FTP_READY) {
         client_log_error("Server did not respond with READY (expected %d, got %d)", FTP_READY, code);
         close(client->control_fd);
         client->control_fd = -1;
@@ -525,6 +593,62 @@ int ftp_pwd(ftp_client_t *client, char *path, size_t size) {
     }
 
     snprintf(path, size, "%s", response);
+    return 0;
+}
+
+int ftp_dele(ftp_client_t *client, const char *remote_file) {
+    if (ensure_connected(client) < 0) {
+        return -1;
+    }
+    if (!remote_file) {
+        client_log_error("Invalid parameters to ftp_dele");
+        return -1;
+    }
+
+    if (send_command(client, "DELE %s", remote_file) < 0) {
+        return -1;
+    }
+
+    int code = 0;
+    if (read_response(client, &code, NULL, 0) < 0) {
+        return -1;
+    }
+    if (code != FTP_FILE_ACTION_OK) {
+        client_log_error("DELE failed with code %d", code);
+        return -1;
+    }
+    client_log_info("Deleted '%s'", remote_file);
+    return 0;
+}
+
+int ftp_rename(ftp_client_t *client, const char *from_path, const char *to_path) {
+    if (ensure_connected(client) < 0) {
+        return -1;
+    }
+    if (!from_path || !to_path) {
+        client_log_error("Invalid parameters to ftp_rename");
+        return -1;
+    }
+
+    int code = 0;
+    if (send_command(client, "RNFR %s", from_path) < 0) {
+        return -1;
+    }
+    if (read_response(client, &code, NULL, 0) < 0 || code != 350) {
+        client_log_error("RNFR failed with code %d", code);
+        return -1;
+    }
+    if (send_command(client, "RNTO %s", to_path) < 0) {
+        return -1;
+    }
+    if (read_response(client, &code, NULL, 0) < 0) {
+        return -1;
+    }
+    if (code != FTP_FILE_ACTION_OK) {
+        client_log_error("RNTO failed with code %d", code);
+        return -1;
+    }
+    client_log_info("Renamed '%s' -> '%s'", from_path, to_path);
     return 0;
 }
 

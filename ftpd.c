@@ -11,6 +11,7 @@ typedef struct {
     int server_port;
     char client_ip[16];
     int client_port;
+    char rename_from[FTP_MAX_PATH];
 } client_session_t;
 
 static void server_log(const char *level, const char *fmt, va_list args) {
@@ -43,6 +44,7 @@ void *handle_client(void *arg) {
     int data_fd = -1;
     int pasv_listen_fd = -1;
     int pasv_port = 0;
+    session->rename_from[0] = '\0';
     
     getcwd(session->current_dir, sizeof(session->current_dir));
     
@@ -183,6 +185,46 @@ void *handle_client(void *arg) {
             close(data_fd);
             data_fd = -1;
             send_ftp_response(control_fd, FTP_SUCCESS, "Transfer complete");
+        }
+        else if (strcasecmp(command, "DELE") == 0) {
+            if (!authenticated) {
+                server_log_error("DELE denied for unauthenticated client %s:%d", session->client_ip, session->client_port);
+                send_ftp_response(control_fd, FTP_LOGIN_FAILED, "Not logged in");
+                continue;
+            }
+            if (unlink(cmd_arg) == 0) {
+                send_ftp_response(control_fd, FTP_FILE_ACTION_OK, "File deleted");
+            } else {
+                server_log_error("Failed to delete '%s': %s", cmd_arg, strerror(errno));
+                send_ftp_response(control_fd, FTP_ACTION_FAILED, "Delete failed");
+            }
+        }
+        else if (strcasecmp(command, "RNFR") == 0) {
+            if (!authenticated) {
+                server_log_error("RNFR denied for unauthenticated client %s:%d", session->client_ip, session->client_port);
+                send_ftp_response(control_fd, FTP_LOGIN_FAILED, "Not logged in");
+                continue;
+            }
+            snprintf(session->rename_from, sizeof(session->rename_from), "%s", cmd_arg);
+            send_ftp_response(control_fd, 350, "Ready for destination name");
+        }
+        else if (strcasecmp(command, "RNTO") == 0) {
+            if (!authenticated) {
+                server_log_error("RNTO denied for unauthenticated client %s:%d", session->client_ip, session->client_port);
+                send_ftp_response(control_fd, FTP_LOGIN_FAILED, "Not logged in");
+                continue;
+            }
+            if (session->rename_from[0] == '\0') {
+                send_ftp_response(control_fd, FTP_ACTION_FAILED, "No source specified");
+                continue;
+            }
+            if (rename(session->rename_from, cmd_arg) == 0) {
+                send_ftp_response(control_fd, FTP_FILE_ACTION_OK, "Renamed");
+            } else {
+                server_log_error("Failed to rename '%s' -> '%s': %s", session->rename_from, cmd_arg, strerror(errno));
+                send_ftp_response(control_fd, FTP_ACTION_FAILED, "Rename failed");
+            }
+            session->rename_from[0] = '\0';
         }
         else if (strcasecmp(command, "RETR") == 0) {
             if (!authenticated) {

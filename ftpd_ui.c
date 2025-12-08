@@ -177,7 +177,7 @@ int main(int argc, char *argv[]) {
     GtkWidget *port_label = gtk_label_new("Port:");
     gtk_widget_set_size_request(port_label, 100, -1);
     port_entry = gtk_entry_new();
-    gtk_entry_set_text(GTK_ENTRY(port_entry), "21");
+    gtk_entry_set_text(GTK_ENTRY(port_entry), "9999");
     gtk_entry_set_placeholder_text(GTK_ENTRY(port_entry), "Port");
     gtk_box_pack_start(GTK_BOX(port_box), port_label, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(port_box), port_entry, TRUE, TRUE, 0);
