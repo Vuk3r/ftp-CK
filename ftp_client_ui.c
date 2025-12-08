@@ -1,4 +1,5 @@
 #include <gtk/gtk.h>
+#include <limits.h>
 #include "ftp_client.h"
 
 static GtkWidget *server_ip_entry;
@@ -16,6 +17,8 @@ static GtkWidget *refresh_button;
 static GtkWidget *local_file_browse_button;
 static GtkWidget *save_path_button;
 static GtkWidget *select_remote_button;
+static GtkWidget *working_dir_entry;
+static GtkWidget *working_dir_button;
 static GtkWidget *status_label;
 
 static ftp_client_t client;
@@ -72,6 +75,21 @@ static void set_connection_state(gboolean is_connected) {
     if (!is_connected) {
         clear_file_list();
     }
+}
+
+static void ensure_local_path_default(const char *remote_file) {
+    const char *local_text = gtk_entry_get_text(GTK_ENTRY(local_file_entry));
+    if (local_text && strlen(local_text) > 0) return;
+    if (!remote_file || strlen(remote_file) == 0) return;
+    const char *base_dir = gtk_entry_get_text(GTK_ENTRY(working_dir_entry));
+    char cwd_buffer[PATH_MAX];
+    if (!base_dir || strlen(base_dir) == 0) {
+        if (!getcwd(cwd_buffer, sizeof(cwd_buffer))) return;
+        base_dir = cwd_buffer;
+    }
+    char path_buffer[PATH_MAX];
+    snprintf(path_buffer, sizeof(path_buffer), "%s/%s", base_dir, remote_file);
+    gtk_entry_set_text(GTK_ENTRY(local_file_entry), path_buffer);
 }
 
 static void update_status(const char *message) {
@@ -184,6 +202,9 @@ static void on_download_clicked(GtkWidget *widget, gpointer data) {
     
     const char *remote_file = gtk_entry_get_text(GTK_ENTRY(remote_file_entry));
     const char *local_file = gtk_entry_get_text(GTK_ENTRY(local_file_entry));
+
+    ensure_local_path_default(remote_file);
+    local_file = gtk_entry_get_text(GTK_ENTRY(local_file_entry));
     
     if (strlen(remote_file) == 0 || strlen(local_file) == 0) {
         update_status("Please specify both remote and local file names");
@@ -232,6 +253,26 @@ static void on_select_save_path_clicked(GtkWidget *widget, gpointer data) {
         if (filename) {
             gtk_entry_set_text(GTK_ENTRY(local_file_entry), filename);
             g_free(filename);
+        }
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void on_select_working_dir_clicked(GtkWidget *widget, gpointer data) {
+    (void)data;
+    GtkWidget *dialog = gtk_file_chooser_dialog_new(
+        "Select Local Working Folder",
+        GTK_WINDOW(gtk_widget_get_toplevel(widget)),
+        GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Open", GTK_RESPONSE_ACCEPT,
+        NULL);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        char *folder = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+        if (folder) {
+            gtk_entry_set_text(GTK_ENTRY(working_dir_entry), folder);
+            g_free(folder);
         }
     }
     gtk_widget_destroy(dialog);
@@ -336,6 +377,26 @@ int main(int argc, char *argv[]) {
     
     gtk_box_pack_start(GTK_BOX(vbox), conn_frame, FALSE, FALSE, 0);
     
+    // Local working dir
+    GtkWidget *work_frame = gtk_frame_new("Local Working Folder");
+    GtkWidget *work_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_container_add(GTK_CONTAINER(work_frame), work_box);
+    gtk_container_set_border_width(GTK_CONTAINER(work_box), 5);
+    GtkWidget *work_label = gtk_label_new("Folder:");
+    gtk_widget_set_size_request(work_label, 100, -1);
+    working_dir_entry = gtk_entry_new();
+    char work_cwd[PATH_MAX];
+    if (getcwd(work_cwd, sizeof(work_cwd))) {
+        gtk_entry_set_text(GTK_ENTRY(working_dir_entry), work_cwd);
+    }
+    gtk_entry_set_placeholder_text(GTK_ENTRY(working_dir_entry), "Local folder for downloads/uploads");
+    working_dir_button = gtk_button_new_with_label("Browse");
+    g_signal_connect(working_dir_button, "clicked", G_CALLBACK(on_select_working_dir_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(work_box), work_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(work_box), working_dir_entry, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(work_box), working_dir_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), work_frame, FALSE, FALSE, 0);
+
     // File list
     GtkWidget *list_frame = gtk_frame_new("Remote Files");
     GtkWidget *list_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
