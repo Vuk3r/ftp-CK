@@ -3,6 +3,7 @@
 #include <stdarg.h>
 #include <strings.h>
 #include <sys/select.h>
+#include <stdbool.h>
 
 typedef struct {
     int control_fd;
@@ -12,7 +13,64 @@ typedef struct {
     char client_ip[16];
     int client_port;
     char rename_from[FTP_MAX_PATH];
+    char username[FTP_MAX_LINE];
 } client_session_t;
+
+typedef struct {
+    char username[64];
+    char password[64];
+} account_t;
+
+static account_t accounts[32];
+static int account_count = 0;
+static bool accounts_loaded = false;
+
+static void add_default_accounts(void) {
+    account_count = 0;
+    snprintf(accounts[account_count].username, sizeof(accounts[account_count].username), "vu");
+    snprintf(accounts[account_count].password, sizeof(accounts[account_count].password), "vu");
+    account_count++;
+    snprintf(accounts[account_count].username, sizeof(accounts[account_count].username), "vuong");
+    snprintf(accounts[account_count].password, sizeof(accounts[account_count].password), "vuong");
+    account_count++;
+}
+
+static void load_accounts(const char *path) {
+    accounts_loaded = true;
+    account_count = 0;
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        add_default_accounts();
+        return;
+    }
+    char line[256];
+    while (fgets(line, sizeof(line), f) && account_count < (int)(sizeof(accounts) / sizeof(accounts[0]))) {
+        char user[64], pass[64];
+        if (line[0] == '#' || strlen(line) < 3) continue;
+        if (sscanf(line, "%63s %63s", user, pass) == 2) {
+            snprintf(accounts[account_count].username, sizeof(accounts[account_count].username), "%s", user);
+            snprintf(accounts[account_count].password, sizeof(accounts[account_count].password), "%s", pass);
+            account_count++;
+        }
+    }
+    fclose(f);
+    if (account_count == 0) {
+        add_default_accounts();
+    }
+}
+
+static bool validate_credentials(const char *user, const char *pass) {
+    if (!accounts_loaded) {
+        load_accounts("accounts.txt");
+    }
+    for (int i = 0; i < account_count; i++) {
+        if (strcmp(accounts[i].username, user) == 0 &&
+            strcmp(accounts[i].password, pass) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static void server_log(const char *level, const char *fmt, va_list args) {
     fprintf(stderr, "[SERVER %s] ", level);
@@ -45,6 +103,7 @@ void *handle_client(void *arg) {
     int pasv_listen_fd = -1;
     int pasv_port = 0;
     session->rename_from[0] = '\0';
+    session->username[0] = '\0';
     
     getcwd(session->current_dir, sizeof(session->current_dir));
     
@@ -61,11 +120,22 @@ void *handle_client(void *arg) {
         sscanf(buffer, "%s %[^\r\n]", command, cmd_arg);
         
         if (strcasecmp(command, "USER") == 0) {
+            snprintf(session->username, sizeof(session->username), "%s", cmd_arg);
+            authenticated = 0;
             send_ftp_response(control_fd, FTP_NEED_PASSWORD, "Password required");
         }
         else if (strcasecmp(command, "PASS") == 0) {
-            authenticated = 1;
-            send_ftp_response(control_fd, FTP_LOGIN_SUCCESS, "Login successful");
+            if (strlen(session->username) == 0) {
+                send_ftp_response(control_fd, FTP_LOGIN_FAILED, "Username required");
+                continue;
+            }
+            if (validate_credentials(session->username, cmd_arg)) {
+                authenticated = 1;
+                send_ftp_response(control_fd, FTP_LOGIN_SUCCESS, "Login successful");
+            } else {
+                authenticated = 0;
+                send_ftp_response(control_fd, FTP_LOGIN_FAILED, "Login failed");
+            }
         }
         else if (strcasecmp(command, "PWD") == 0) {
             char response[FTP_MAX_LINE];
